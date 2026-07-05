@@ -1,0 +1,11 @@
+.env
+*.db
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+ping_gemini.py
+test_gemini.py
+test_whatsapp_flow.py
