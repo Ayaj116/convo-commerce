@@ -1,0 +1,12 @@
+# Core runtime
+fastapi>=0.110
+uvicorn[standard]>=0.29
+requests>=2.31
+python-dotenv>=1.0
+
+# AI providers (install only the one(s) you use)
+anthropic>=0.39           # AI_PROVIDER=claude
+openai>=1.40              # AI_PROVIDER=openai
+google-genai>=0.8         # AI_PROVIDER=gemini
+
+# The 'mock' provider and the SQLite layer need no extra packages.

@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: convo-commerce
+    runtime: python
+    buildCommand: pip install -r requirements.txt && python scripts/seed_data.py
+    startCommand: python -m uvicorn src.gateway.app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: AI_PROVIDER
+        value: gemini
+      - key: GEMINI_MODEL
+        value: gemini-2.0-flash
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: WHATSAPP_ACCESS_TOKEN
+        sync: false
+      - key: WHATSAPP_PHONE_NUMBER_ID
+        sync: false
+      - key: WHATSAPP_VERIFY_TOKEN
+        sync: false
+      - key: WHATSAPP_APP_SECRET
+        sync: false
+      - key: STORE_NAME
+        value: Aurora Store
+      - key: STORE_CURRENCY
+        value: USD
+      - key: DB_PATH
+        value: /tmp/convo_commerce.db
+      - key: PAYMENT_LINK_BASE
+        value: https://pay.example.com/checkout
