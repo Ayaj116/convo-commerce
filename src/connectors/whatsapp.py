@@ -59,13 +59,14 @@ class WhatsAppConnector:
                         "sender_id": sender,
                         "text": msg["text"]["body"],
                         "name": contacts.get(sender),
+                        "platform_message_id": msg.get("id"),
                     })
         return events
 
     # -- 24-hour window --------------------------------------------------
     def within_service_window(self, sender_id: str) -> bool:
         """True if the last inbound message was < 24h ago."""
-        last = tools.last_inbound_time(f"{self.channel}:{sender_id}")
+        last = tools.last_inbound_time_for_profile(self.channel, sender_id)
         if not last:
             return False
         try:
