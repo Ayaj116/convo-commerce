@@ -15,5 +15,5 @@ google-adk>=0.3           # Google Agent Development Kit (root + specialist sub-
 
 # Channel integration — WhatsApp via Twilio (30-day trial, 3rd party)
 twilio>=9.0               # CHANNEL WhatsApp sender/inbound (WHATSAPP_PROVIDER=twilio)
-
+gunicorn
 # The 'mock' provider and the SQLite layer need no extra packages.
