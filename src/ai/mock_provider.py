@@ -15,7 +15,10 @@ from src.ai.base import AIProvider, AIResponse, ToolCall
 
 _GREET = re.compile(r"\b(hi|hello|hey|good (morning|afternoon|evening)|start)\b", re.I)
 _TRACK = re.compile(r"\b(track|where.*order|status|delivery)\b", re.I)
+_INVOICE = re.compile(r"\binvoice\b", re.I)
 _NUM = re.compile(r"\b(\d+)\b")
+_UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+_IDENTITY = re.compile(r"\[Customer identity:\s*([^\]]+)\]")
 
 
 def _last_user(messages: list[dict]) -> str:
@@ -55,44 +58,55 @@ class MockProvider(AIProvider):
     def generate(self, system: str, messages: list[dict], tools: list[dict]) -> AIResponse:
         text = _last_user(messages)
         results = _tool_results(messages)
+        identity = _extract_identity(messages)
+        customer_id = identity.get("customer_id")
 
         user = results.get("get_user_by_phone_or_profile_id") or {}
-        user_id = user.get("user_id") if isinstance(user, dict) else None
+        name = user.get("full_name") if isinstance(user, dict) else None
 
-        # 1) Always identify the user first.
-        if not _called(messages, "get_user_by_phone_or_profile_id"):
-            ident = _extract_identity(messages)
-            return AIResponse(tool_calls=[ToolCall(_tid(),
-                "get_user_by_phone_or_profile_id", ident)])
-
-        name = user.get("name") if isinstance(user, dict) else None
-
-        # 2) Pure greeting with no product intent yet -> warm welcome.
+        # 1) Pure greeting with no product intent yet -> warm welcome.
         if _GREET.search(text) and not _product_intent(text):
             hi = f"Hi {name}! " if name else "Hi there! "
             return AIResponse(text=(
                 f"{hi}Welcome to the store 👋 I can help you find products and "
                 f"place an order. What are you shopping for today?"))
 
+        # 2) Invoice requests.
+        if _INVOICE.search(text) and not _called(messages, "get_invoice"):
+            m = _UUID.search(text)
+            if m:
+                return AIResponse(tool_calls=[ToolCall(_tid(), "get_invoice", {"order_id": m.group(0)})])
+            return AIResponse(text="Sure — what's the order number for that invoice?")
+
+        if "get_invoice" in results:
+            inv = results["get_invoice"]
+            if isinstance(inv, dict) and inv.get("invoice_number"):
+                return AIResponse(text=(
+                    f"Here's your invoice {inv['invoice_number']}: total "
+                    f"{inv.get('currency', 'USD')} {inv['total']:.2f}, status {inv['status']}. "
+                    f"Anything else I can help with?"))
+            if isinstance(inv, dict) and inv.get("status") == "not_available":
+                return AIResponse(text=inv.get("message", "That invoice isn't available yet."))
+            return AIResponse(text="I couldn't find an invoice for that order.")
+
         # 3) Tracking / aftersales path.
         if _TRACK.search(text) and not _called(messages, "get_order"):
-            m = _NUM.search(text)
+            m = _UUID.search(text)
             if m:
-                return AIResponse(tool_calls=[ToolCall(_tid(), "get_order",
-                    {"order_id": int(m.group(1))})])
+                return AIResponse(tool_calls=[ToolCall(_tid(), "get_order", {"order_id": m.group(0)})])
             return AIResponse(text="Happy to help track that! What's your order number?")
 
         if "get_order" in results:
             o = results["get_order"]
-            if isinstance(o, dict) and o.get("order_id"):
+            if isinstance(o, dict) and o.get("id"):
                 label = o.get("status", "processing").replace("_", " ").lower()
+                items = ", ".join(f"{i['product']['name']} x{i['quantity']}" for i in o.get("items", []))
                 return AIResponse(text=(
-                    f"Order #{o['order_id']} ({o['product']['name']} ×{o['quantity']}) "
-                    f"is currently *{label}*. Total {o['currency']} {o['total_amount']:.2f}. "
-                    f"Anything else I can help with?"))
+                    f"Order #{o['order_number']} ({items}) is currently *{label}*. "
+                    f"Total {o['currency']} {o['total']:.2f}. Anything else I can help with?"))
             return AIResponse(text="I couldn't find that order number — could you double-check it?")
 
-        # 3) Product discovery.
+        # 4) Product discovery.
         if not _called(messages, "get_products_by_category_or_search"):
             q = _extract_query(text)
             return AIResponse(tool_calls=[ToolCall(_tid(),
@@ -103,35 +117,36 @@ class MockProvider(AIProvider):
             # If the user picked a quantity/product, place the order.
             chosen = _match_product(text, products)
             qty = _extract_qty(text)
-            if chosen and qty and user_id:
+            if chosen and qty and customer_id:
                 return AIResponse(tool_calls=[ToolCall(_tid(), "create_order", {
-                    "user_id": user_id, "product_id": chosen["product_id"],
-                    "quantity": qty, "delivery_address": _extract_address(messages)})])
+                    "customer_id": customer_id,
+                    "items": [{"product_id": chosen["id"], "quantity": qty}],
+                    "delivery_address": _extract_address(messages)})])
             # Otherwise present the shortlist.
-            lines = [f"• {p['name']} — {p['currency']} {p['price']:.2f} "
-                     f"({'in stock' if p['stock_quantity'] else 'out of stock'})"
+            lines = [f"• {p['name']} — {p.get('currency', 'USD')} {p['price']:.2f} "
+                     f"({'in stock' if p.get('stock_quantity') else 'out of stock'})"
                      for p in products[:4]]
             return AIResponse(text=(
                 "Here's what I found:\n" + "\n".join(lines) +
                 "\n\nWhich one would you like, and how many?"))
 
-        # 4) Payment after order creation.
+        # 5) Payment after order creation.
         if "create_order" in results and "create_payment_link" not in results:
             order = results["create_order"]
-            if isinstance(order, dict) and order.get("order_id"):
+            if isinstance(order, dict) and order.get("id"):
                 return AIResponse(tool_calls=[ToolCall(_tid(), "create_payment_link",
-                    {"order_id": order["order_id"], "method": "external"})])
+                    {"order_id": order["id"], "method": "external"})])
             if isinstance(order, dict) and order.get("error"):
                 return AIResponse(text=_order_error_text(order))
 
         if "create_payment_link" in results:
             order = results.get("create_order", {})
             pay = results["create_payment_link"]
-            oid = order.get("order_id") if isinstance(order, dict) else "?"
-            total = order.get("total_amount", 0) if isinstance(order, dict) else 0
+            order_number = order.get("order_number") if isinstance(order, dict) else "?"
+            total = order.get("total", 0) if isinstance(order, dict) else 0
             url = pay.get("url", "") if isinstance(pay, dict) else ""
             return AIResponse(text=(
-                f"You're all set! I've created order #{oid} for a total of "
+                f"You're all set! I've created order #{order_number} for a total of "
                 f"{order.get('currency','USD')} {total:.2f}. 🎉\n\n"
                 f"Complete your payment here: {url}\n\n"
                 f"Once payment clears I'll confirm and share tracking updates. "
@@ -145,11 +160,16 @@ class MockProvider(AIProvider):
 # --- tiny heuristics --------------------------------------------------------
 def _extract_identity(messages: list[dict]) -> dict:
     for m in messages:
-        meta = m.get("_meta") or {}
-        if meta.get("phone_number"):
-            return {"phone_number": meta["phone_number"]}
-        if meta.get("messenger_id"):
-            return {"messenger_id": meta["messenger_id"]}
+        if m.get("role") != "user":
+            continue
+        match = _IDENTITY.search(m.get("content", "") or "")
+        if match:
+            out: dict[str, str] = {}
+            for pair in match.group(1).split(","):
+                if "=" in pair:
+                    k, v = pair.split("=", 1)
+                    out[k.strip()] = v.strip()
+            return out
     return {}
 
 
@@ -202,7 +222,8 @@ def _extract_address(messages: list[dict]) -> str | None:
 def _order_error_text(order: dict) -> str:
     err = order.get("error")
     if err == "insufficient_stock":
-        return (f"Sorry — we only have {order['available']} of {order['product']} in stock "
+        available = order.get("available", "fewer")
+        return (f"Sorry — we only have {available} of {order.get('product', 'that item')} in stock "
                 f"right now. Would you like that quantity instead?")
     if err == "product_not_found":
         return "Hmm, I couldn't find that product. Want me to show the options again?"

@@ -3,10 +3,17 @@ fastapi>=0.110
 uvicorn[standard]>=0.29
 requests>=2.31
 python-dotenv>=1.0
+psycopg2-binary>=2.9      # Supabase / Postgres
 
 # AI providers (install only the one(s) you use)
 anthropic>=0.39           # AI_PROVIDER=claude
 openai>=1.40              # AI_PROVIDER=openai
 google-genai>=0.8         # AI_PROVIDER=gemini
+
+# Agentic framework — the Convo-Commerce multi-agent brain (AGENT_ENGINE=adk)
+google-adk>=0.3           # Google Agent Development Kit (root + specialist sub-agents)
+
+# Channel integration — WhatsApp via Twilio (30-day trial, 3rd party)
+twilio>=9.0               # CHANNEL WhatsApp sender/inbound (WHATSAPP_PROVIDER=twilio)
 
 # The 'mock' provider and the SQLite layer need no extra packages.

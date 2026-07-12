@@ -1,16 +1,21 @@
-# Conversational Commerce Agent
+# Convo-Commerce
 
-An AI shopping assistant that runs inside **WhatsApp Business** and **Facebook
-Messenger**. It takes a customer from *“I want shoes”* all the way to a **paid,
-tracked order** — using a real product catalog, real orders, and a pluggable AI
-brain you can switch between **Claude, ChatGPT (OpenAI), and Gemini**.
+A **multi-agent conversational commerce platform** for **SYSCO-style food
+delivery**. Customers order over **WhatsApp, Telegram, Instagram, and Facebook
+Messenger** in plain language; a team of AI agents takes them from *"reorder my
+usuals"* all the way to a **paid, tracked, delivered order** — with a real
+catalog, real orders, real payments, and a live **Supabase** database.
 
-The whole flow runs **offline with zero API keys** using a built-in deterministic
-`mock` provider, so you can demo it in seconds.
+The agent brain is built on the **Google Agent Development Kit (ADK)**: a root
+orchestrator delegates each message to a specialist sub-agent (ordering,
+checkout, tracking, refunds, recommendations). WhatsApp is integrated through
+**Twilio** (3rd-party, works on a 30-day trial with no Meta app review), with
+the Meta Cloud API available as an alternative path.
 
 ```bash
-python demo.py        # full discovery → order → payment → tracking demo
-python tests/test_flow.py
+python scripts/seed_data.py    # seed the SYSCO food catalog (idempotent)
+python demo_tools.py           # NO LLM — validates ETA/order/payment/refund/recs vs Supabase
+python demo_adk.py             # full multi-agent conversation (needs google-adk + GOOGLE_API_KEY)
 ```
 
 ---
@@ -19,83 +24,85 @@ python tests/test_flow.py
 
 | Capability | How |
 |---|---|
-| **User initiation** | Webhooks detect a new WhatsApp / Messenger message |
-| **User identification** | Phone number (WhatsApp) or PSID (Messenger) → find-or-create user |
-| **Product discovery** | AI queries the catalog and recommends real items |
-| **Order placement** | Confirms product, qty, address; validates stock & price; reserves stock |
-| **Payment** | WhatsApp Pay / Messenger checkout / external payment link |
-| **Confirmation & tracking** | Order stored, order ID returned, event-driven status updates |
-| **Aftersales** | Order lookup, returns/refunds via status lifecycle |
-| **Compliance** | WhatsApp 24-hour window enforced; Messenger message tags out of window |
-| **Model choice** | `AI_PROVIDER = mock | claude | openai | gemini` |
+| **Omnichannel intake** | Webhooks read messages from WhatsApp (Twilio *or* Meta), Telegram, Instagram, Messenger; redelivery is de-duped via `platform_message_id` |
+| **Multi-agent brain (ADK)** | Root orchestrator → ordering / checkout / tracking / refund / recommendation specialists, each with only the tools it needs |
+| **Identity** | Phone (WhatsApp), IGSID (Instagram), PSID (Messenger), chat id (Telegram) → find-or-create `customers` + `customer_profiles`; identity is injected into agent session state, never asked for or spoofable |
+| **Personalised recs** | Returning customers get re-order suggestions built from their own order history (falls back to popular in-stock items) |
+| **Ordering** | Multi-item food orders; server-computed pricing; atomic stock decrement (Postgres function, no oversell race) |
+| **ETA before & after checkout** | Pre-checkout: a delivery *window* ("40–55 min") from the address registered to the profile. Post-checkout: a *promised arrival time* anchored to the order, saved on the order |
+| **Payments** | A secure payment link at checkout; on confirmation the order is saved PAID **in real time** and the customer gets an automatic text confirmation (with ETA + invoice) on their channel |
+| **Follow-ups & tracking** | Status lifecycle + event-driven notifications pushed back to the originating channel |
+| **Refunds** | `process_refund` refunds the payment, cancels + restocks the order, and voids the invoice |
+| **Invoicing** | Invoice auto-issued on payment confirmation |
 
 ---
 
 ## Architecture
 
-Five layers, one continuous conversation. See **`docs/architecture.html`** for the
-presentation-ready diagram.
-
 ```
- Customer Channels     WhatsApp Business API  ·  Facebook Messenger
-        │                       (signed webhooks)
-        ▼
- API Gateway           verify signature · parse · 24h-window policy · route
-        │                       (normalised event)
-        ▼
- Conversation Agent    identify → reason → act loop
-        │              pluggable AI provider  [ claude | openai | gemini | mock ]
-        ▼
- Internal Tools        getUser · getProducts · createOrder · updateOrderStatus
-        │              createPaymentLink · getOrder · logMessage
-        ▼
- Data Model            Users · Products · Orders · Messages  (+ order_events)
-        ↺
- Event Bus             order.status_changed → push tracking update to channel
+ Channels        WhatsApp (Twilio / Meta) · Telegram · Instagram · Messenger
+     │                     signed webhooks (HMAC / Twilio sig / secret token)
+     ▼
+ API Gateway     verify · parse · route          (src/gateway/app.py)
+     │                     (normalised event)
+     ▼
+ ADK Multi-Agent   convo_commerce_root  (orchestrator / router)
+     │             ├── ordering_agent        discovery → cart → address → ETA → order
+     │             ├── checkout_agent         payment link + promised ETA
+     │             ├── tracking_agent         status · follow-ups · invoice
+     │             ├── refund_agent           refunds / aftersales
+     │             └── recommendation_agent   personalised re-orders
+     ▼
+ Tools           find_menu_items · save_my_address · delivery_eta · place_order ·
+     │           checkout · order_status · my_orders · get_order_invoice ·
+     │           refund_order · recommend_for_me   (validated; no raw SQL for the model)
+     ▼
+ Data (Supabase) customers/customer_profiles · customer_addresses · conversations/
+     │           messages · products · orders/order_items/order_status_history ·
+     │           payments · invoices                     (PostgREST, schema `commerce`)
+     ↺
+ Event Bus       order.status_changed → real-time channel confirmation (ETA + invoice)
 ```
 
-**Design principles:** modular channel connectors, a single API gateway,
-event-driven notifications, and a database that the AI can *only* reach through
-validated tool calls — never raw SQL.
+The agent can only touch the database through validated tool calls (never raw
+SQL), all DB access uses the Supabase `service_role` key server-side, and the
+customer's identity lives in session state — so an agent can't act as a
+different customer. If `google-adk` isn't installed, the gateway falls back to
+the single-loop `ConversationAgent` (`AGENT_ENGINE=legacy`).
 
 ---
 
 ## Project layout
 
 ```
-convo-commerce/
-├── config.py                  # env-driven config incl. AI provider selection
-├── demo.py                    # runnable end-to-end demo (offline)
-├── requirements.txt
-├── .env.example
+convo-commerce-AI/
+├── config.py                     # env-driven config (agent engine, ETA, channels)
+├── demo_tools.py                 # NO-LLM validation of the new logic vs Supabase
+├── demo_adk.py                   # multi-agent conversation demo
 ├── src/
-│   ├── db/
-│   │   ├── schema.sql         # relational schema (portable to Postgres)
-│   │   ├── database.py        # sqlite connection + transactions
-│   │   └── models.py          # domain models + OrderStatus lifecycle
+│   ├── adk/                      # Google ADK multi-agent brain
+│   │   ├── adk_tools.py          #   tools the agents call (identity from session state)
+│   │   ├── agents.py             #   root orchestrator + 5 specialist sub-agents
+│   │   └── runner.py             #   session mgmt + message→reply bridge (async + sync)
 │   ├── tools/
-│   │   ├── tools.py           # the internal CRUD tool calls
-│   │   └── registry.py        # provider-agnostic JSON tool schemas + dispatch
-│   ├── ai/
-│   │   ├── base.py            # normalized message/response + provider protocol
-│   │   ├── factory.py         # picks provider from AI_PROVIDER
-│   │   ├── mock_provider.py   # offline deterministic brain (default)
-│   │   ├── claude_provider.py
-│   │   ├── openai_provider.py
-│   │   └── gemini_provider.py
+│   │   ├── tools.py              # business logic incl. ETA, refunds, recs, addresses
+│   │   ├── eta.py                # delivery ETA engine (pre & post checkout)
+│   │   └── registry.py           # tool schemas for the legacy provider path
 │   ├── connectors/
-│   │   ├── base.py            # HMAC signature verification
-│   │   ├── whatsapp.py        # Cloud API + 24h window enforcement
-│   │   └── messenger.py       # Send API + message tags
-│   ├── agent/
-│   │   ├── prompt.py          # system prompt / persona / guardrails
-│   │   ├── conversation.py    # the identify → tool-loop orchestrator
-│   │   └── notifications.py   # event bus + tracking notifier
-│   └── gateway/
-│       └── app.py             # FastAPI webhooks for both channels
-├── scripts/seed_data.py       # demo catalog + sample customer
-├── tests/test_flow.py
-└── docs/architecture.html     # executive-ready architecture diagram
+│   │   ├── __init__.py           # channel→connector factory (WhatsApp provider switch)
+│   │   ├── twilio_whatsapp.py    # WhatsApp via Twilio (30-day trial)
+│   │   ├── whatsapp.py           # WhatsApp via Meta Cloud API (alt path)
+│   │   ├── instagram.py          # Instagram DMs (Graph API)
+│   │   ├── messenger.py          # Facebook Messenger
+│   │   └── telegram.py           # Telegram Bot API
+│   ├── agent/                    # legacy single-loop engine + notifications
+│   ├── db/
+│   │   ├── migration_001.sql     # base columns + stock functions
+│   │   ├── migration_003.sql     # customer_addresses + orders.promised_eta
+│   │   └── database.py           # PostgREST REST wrapper
+│   └── gateway/app.py            # FastAPI webhooks for every channel
+├── scripts/seed_data.py          # SYSCO food catalog
+└── docs/architecture.html        # architecture diagram
 ```
 
 ---
@@ -103,28 +110,44 @@ convo-commerce/
 ## Setup
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt        # only needed for real providers / gateway
-cp .env.example .env                   # then edit
-
-python scripts/seed_data.py            # load demo catalog
+python -m venv .venv && source .venv/bin/activate   # (Windows: .venv\Scripts\activate)
+pip install -r requirements.txt
+cp .env.example .env                                # then edit
 ```
 
-### Choosing the AI model
-
-Set one environment variable:
+Run the SQL migrations once in the Supabase SQL Editor:
+`src/db/migration_001.sql` then `src/db/migration_003.sql`. Then:
 
 ```bash
-AI_PROVIDER=mock      # offline, no keys (default)
-AI_PROVIDER=claude    # needs ANTHROPIC_API_KEY   (+ CLAUDE_MODEL)
-AI_PROVIDER=openai    # needs OPENAI_API_KEY       (+ OPENAI_MODEL)
-AI_PROVIDER=gemini    # needs GOOGLE_API_KEY       (+ GEMINI_MODEL)
+python scripts/seed_data.py       # SYSCO food catalog
+python demo_tools.py              # validate the flow with no LLM
 ```
 
-All four providers implement the **same tool-calling loop** — the agent code path
-never changes, only the adapter behind `get_provider()`.
+### Agent engine
 
-### Running the webhook gateway
+```bash
+AGENT_ENGINE=adk        # Google ADK multi-agent (default)
+ADK_MODEL=gemini-2.0-flash
+GOOGLE_API_KEY=...      # ADK uses the Gemini Developer API by default
+AGENT_ENGINE=legacy     # fall back to the single-loop ConversationAgent
+```
+
+### WhatsApp via Twilio (30-day trial)
+
+```bash
+WHATSAPP_PROVIDER=twilio
+TWILIO_ACCOUNT_SID=...          # Twilio Console → Account Info
+TWILIO_AUTH_TOKEN=...
+TWILIO_WHATSAPP_FROM=whatsapp:+14155238886   # Twilio WhatsApp sandbox sender
+```
+
+In the Twilio Console → *Messaging → Try it out → WhatsApp sandbox*, join the
+sandbox from your phone, then point the sandbox **"When a message comes in"**
+webhook at `POST https://<your-tunnel>/webhook/whatsapp`. The connector verifies
+Twilio's `X-Twilio-Signature` and replies with TwiML. Set
+`WHATSAPP_PROVIDER=cloud` to use the Meta Cloud API creds instead.
+
+### Running the gateway
 
 ```bash
 uvicorn src.gateway.app:app --reload --port 8000
@@ -132,49 +155,43 @@ uvicorn src.gateway.app:app --reload --port 8000
 
 | Method & path | Purpose |
 |---|---|
-| `GET  /webhook/whatsapp` · `/webhook/messenger` | Meta verification handshake |
-| `POST /webhook/whatsapp` · `/webhook/messenger` | Inbound customer events |
+| `POST /webhook/whatsapp` | Inbound WhatsApp (Twilio form or Meta JSON, per `WHATSAPP_PROVIDER`) |
+| `GET/POST /webhook/messenger` · `/webhook/instagram` | Meta verify handshake + inbound events |
+| `POST /webhook/telegram` | Inbound Telegram (secret-token header) |
 | `POST /orders/{id}/status?status=SHIPPED` | Ops: advance an order (fires tracking) |
-| `GET  /health` | Liveness + active AI provider |
+| `POST /payments/{id}/confirm?payment_reference=...` | Ops: confirm payment → saves PAID, issues invoice, sends real-time confirmation |
+| `GET /health` | Liveness + active engine / WhatsApp provider |
 
-Point your Meta app's webhook at these URLs (use a tunnel like ngrok in dev).
-
----
-
-## The internal tool calls
-
-The model can only act through these validated functions:
-
-```python
-getUserByPhoneOrProfileID(phone_number=…, messenger_id=…)   # fetch user
-getProductsByCategoryOrSearch(query=…, category=…)          # query catalog
-createOrder(user_id, product_id, quantity, delivery_address) # place order (reserves stock)
-updateOrderStatus(order_id, status)                          # tracking lifecycle
-createPaymentLink(order_id, method)                          # whatsapp_pay | messenger_pay | external
-getOrder(order_id)                                           # tracking / aftersales
-logMessage(chat_id, user_id, content)                        # conversation context
-```
-
-Order lifecycle: `PENDING_PAYMENT → PAID → PACKED → SHIPPED → OUT_FOR_DELIVERY →
-DELIVERED` (or `CANCELLED` / `REFUNDED`, which restock automatically).
+Ops endpoints require an `X-Ops-Key` header matching `OPS_API_KEY`. For Instagram
+and Messenger, point the Meta app webhooks at the URLs above; for Telegram run
+`python scripts/set_telegram_webhook.py https://<your-tunnel>` once.
 
 ---
 
-## Compliance notes
+## ETA, recommendations, refunds
 
-- **WhatsApp 24-hour window** — outside the window the connector refuses free-form
-  text and signals that an approved **template** must be used instead.
-- **Messenger** — order/shipping notifications sent outside the window use the
-  `POST_PURCHASE_UPDATE` message tag.
-- **Webhook security** — every inbound POST is verified against the app secret
-  (`X-Hub-Signature-256`).
+- **ETA** (`src/tools/eta.py`) is deterministic — no maps dependency — so a demo
+  quotes stable, believable windows. Travel time is a stable function of the
+  delivery zone (postal code / city) plus kitchen prep and a peak-hour surcharge
+  (all tunable via `ETA_*` env vars). Swap `_travel_minutes` for a real routing
+  API in production without touching callers.
+- **Recommendations** (`recommend_for_customer`) rank the customer's own most-
+  ordered products first (ideal for food re-orders), topping up with popular
+  in-stock items so there's always a suggestion.
+- **Refunds** (`process_refund`) mark the payment `REFUNDED`, cancel the order
+  (which restocks it), and void the invoice — surfaced to the customer with the
+  refunded amount.
 
 ---
 
 ## Notes on going to production
 
-- Swap SQLite for Postgres: replace `src/db/database.py`; the schema DDL is portable.
-- Replace the in-process event bus in `notifications.py` with SNS / PubSub / Kafka.
-- Add per-provider rate-limit handling, retries, and structured logging/metrics.
-- Wire real WhatsApp Pay `order_details` payloads / Messenger webviews in
-  `create_payment_link` and the connectors.
+- Swap ADK's `InMemorySessionService` for `DatabaseSessionService` so agent
+  sessions survive restarts and scale horizontally.
+- Replace the in-process event bus (`notifications.py`) with SNS / PubSub / Kafka.
+- Wire a real payment gateway webhook (Stripe/Razorpay/etc.) into
+  `POST /payments/{id}/confirm` instead of triggering it from ops.
+- Behind a proxy/tunnel, set `X-Forwarded-Proto/Host` so Twilio signature
+  verification reconstructs the correct public URL.
+- Rotate `OPS_API_KEY` and put the ops endpoints behind real auth before
+  exposing the gateway publicly.
